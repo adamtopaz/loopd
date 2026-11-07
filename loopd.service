@@ -1,0 +1,24 @@
+# loopd as a systemd user service. To install:
+#   install -Dm755 loopd ~/.local/bin/loopd
+#   install -Dm644 loopd.service ~/.config/systemd/user/loopd.service
+#   systemctl --user daemon-reload && systemctl --user enable --now loopd
+#   loginctl enable-linger "$USER"   # keep it running while you're logged out
+# Follow it with: journalctl --user -u loopd -f
+
+[Unit]
+Description=loopd: run coding agents in a loop
+
+[Service]
+ExecStart=%h/.local/bin/loopd run %h/.config/loopd/config.json
+Restart=on-failure
+RestartSec=30
+# Only loopd gets SIGTERM, so that it can stop its passes in order.
+KillMode=mixed
+TimeoutStopSec=30
+# A service doesn't see your login shell's environment. Give the agents what they need, such as
+# a PATH that finds claude, codex, gh, git and node, here or in an environment file.
+#Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+#EnvironmentFile=%h/.config/loopd/env
+
+[Install]
+WantedBy=default.target

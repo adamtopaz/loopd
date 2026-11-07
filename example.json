@@ -1,0 +1,23 @@
+{
+  "logs": "~/.loopd/logs",
+  "workers": [
+    {
+      "name": "supervisor",
+      "engine": "claude",
+      "dir": "~/kb",
+      "prompt": "/supervisor",
+      "every": "20m",
+      "timeout": "90m"
+    },
+    {
+      "name": "researcher-codex",
+      "engine": "codex",
+      "dir": "~/kb-codex",
+      "prompt": "Use the researcher skill.",
+      "every": "30m",
+      "timeout": "2h",
+      "args": ["--sandbox", "workspace-write"],
+      "env": {"EXAMPLE": "value"}
+    }
+  ]
+}
