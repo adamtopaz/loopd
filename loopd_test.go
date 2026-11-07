@@ -43,6 +43,16 @@ func TestCommand(t *testing.T) {
 	if !reflect.DeepEqual(codex, want) {
 		t.Errorf("codex: got %q, want %q", codex, want)
 	}
+	claude = command(Worker{Engine: "claude", Prompt: "/researcher", Model: "claude-opus-5-5", Effort: "xhigh", Args: []string{"--debug"}})
+	want = []string{"claude", "-p", "/researcher", "--output-format", "stream-json", "--verbose", "--model", "claude-opus-5-5", "--effort", "xhigh", "--debug"}
+	if !reflect.DeepEqual(claude, want) {
+		t.Errorf("claude with model: got %q, want %q", claude, want)
+	}
+	codex = command(Worker{Engine: "codex", Prompt: "go", Model: "gpt-5.5", Effort: "xhigh"})
+	want = []string{"codex", "exec", "--json", "--model", "gpt-5.5", "-c", `model_reasoning_effort="xhigh"`, "--", "go"}
+	if !reflect.DeepEqual(codex, want) {
+		t.Errorf("codex with model: got %q, want %q", codex, want)
+	}
 }
 
 func TestParseConfig(t *testing.T) {
@@ -92,7 +102,7 @@ func TestDefaultPaths(t *testing.T) {
 }
 
 func TestPassLogsAndSummary(t *testing.T) {
-	bin := fakeEngine(t, `echo '{"type":"system","subtype":"init"}'
+	bin := fakeEngine(t, `echo '{"type":"system","subtype":"init","model":"claude-opus-5-5"}'
 echo "worker=$LOOPD_WORKER extra=$EXTRA dir=$(pwd) args=$*" >&2
 echo '{"type":"result","result":"Reviewed #29.\nMore detail.","total_cost_usd":1.234}'`)
 	worker := testWorker(t, bin)
@@ -102,7 +112,7 @@ echo '{"type":"result","result":"Reviewed #29.\nMore detail.","total_cost_usd":1
 	if r.err != nil || r.exit != 0 || r.stopped != "" {
 		t.Fatalf("result %+v", r)
 	}
-	if r.summary != "$1.23: Reviewed #29." {
+	if r.summary != "claude-opus-5-5 $1.23: Reviewed #29." {
 		t.Errorf("summary %q", r.summary)
 	}
 	stderr, _ := os.ReadFile(strings.TrimSuffix(logPath, ".jsonl") + ".stderr")

@@ -36,6 +36,8 @@ type Worker struct {
 	Bin     string            `json:"bin"`
 	Dir     string            `json:"dir"`
 	Prompt  string            `json:"prompt"`
+	Model   string            `json:"model"`
+	Effort  string            `json:"effort"`
 	Every   Duration          `json:"every"`
 	Timeout Duration          `json:"timeout"`
 	Args    []string          `json:"args"`
@@ -140,9 +142,23 @@ func command(worker Worker) []string {
 		bin = worker.Engine
 	}
 	if worker.Engine == "claude" {
-		return append([]string{bin, "-p", worker.Prompt, "--output-format", "stream-json", "--verbose"}, worker.Args...)
+		argv := []string{bin, "-p", worker.Prompt, "--output-format", "stream-json", "--verbose"}
+		if worker.Model != "" {
+			argv = append(argv, "--model", worker.Model)
+		}
+		if worker.Effort != "" {
+			argv = append(argv, "--effort", worker.Effort)
+		}
+		return append(argv, worker.Args...)
 	}
-	argv := append([]string{bin, "exec", "--json"}, worker.Args...)
+	argv := []string{bin, "exec", "--json"}
+	if worker.Model != "" {
+		argv = append(argv, "--model", worker.Model)
+	}
+	if worker.Effort != "" {
+		argv = append(argv, "-c", fmt.Sprintf("model_reasoning_effort=%q", worker.Effort))
+	}
+	argv = append(argv, worker.Args...)
 	return append(argv, "--", worker.Prompt)
 }
 
@@ -238,10 +254,12 @@ func removeIfEmpty(path string) {
 
 // event holds the fields loopd reads from Claude's stream-json and Codex's JSONL output.
 type event struct {
-	Type   string  `json:"type"`
-	Result string  `json:"result"`
-	Cost   float64 `json:"total_cost_usd"`
-	Item   struct {
+	Type    string  `json:"type"`
+	Subtype string  `json:"subtype"`
+	Model   string  `json:"model"`
+	Result  string  `json:"result"`
+	Cost    float64 `json:"total_cost_usd"`
+	Item    struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"item"`
@@ -251,20 +269,23 @@ type event struct {
 	} `json:"usage"`
 }
 
-// summarize returns the cost or token use of a pass and the first line of its final message.
+// summarize returns the model Claude reports, the cost or token use of a pass, and the first line
+// of its final message.
 func summarize(logPath string) string {
 	file, err := os.Open(logPath)
 	if err != nil {
 		return ""
 	}
 	defer file.Close()
-	var text, usage string
+	var model, text, usage string
 	reader := bufio.NewReader(file)
 	for {
 		line, err := reader.ReadBytes('\n')
 		var e event
 		if json.Unmarshal(line, &e) == nil {
 			switch {
+			case e.Type == "system" && e.Subtype == "init" && model == "": // Claude
+				model = e.Model
 			case e.Type == "result": // Claude
 				text, usage = e.Result, fmt.Sprintf("$%.2f", e.Cost)
 			case e.Type == "item.completed" && e.Item.Type == "agent_message": // Codex
@@ -280,6 +301,9 @@ func summarize(logPath string) string {
 	text, _, _ = strings.Cut(strings.TrimSpace(text), "\n")
 	if runes := []rune(text); len(runes) > 200 {
 		text = string(runes[:200]) + "…"
+	}
+	if model != "" {
+		usage = strings.TrimSpace(model + " " + usage)
 	}
 	switch {
 	case usage == "":

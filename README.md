@@ -55,6 +55,8 @@ valid, and leaves loopd idle until workers are added.
 | `workers[].bin` | The engine's binary. Default: `claude` or `codex` on `PATH`. |
 | `workers[].dir` | Working directory for the pass. |
 | `workers[].prompt` | The prompt for each pass, such as `/supervisor` to run a Claude Code skill. |
+| `workers[].model` | Model, such as `claude-opus-5-5`. Default: the engine's own setting. |
+| `workers[].effort` | Reasoning effort, such as `xhigh`. Default: the engine's own setting. |
 | `workers[].every` | Wait after a pass ends before the next starts, such as `"20m"`. |
 | `workers[].timeout` | Longest a pass may run before loopd kills it. Default `"1h"`. |
 | `workers[].args` | Extra command-line options for the engine. |
@@ -62,13 +64,14 @@ valid, and leaves loopd idle until workers are added.
 
 A pass runs:
 
-- `claude -p <prompt> --output-format stream-json --verbose <args>`
-- `codex exec --json <args> -- <prompt>`
+- `claude -p <prompt> --output-format stream-json --verbose [--model <model>] [--effort <effort>] <args>`
+- `codex exec --json [--model <model>] [-c model_reasoning_effort="<effort>"] <args> -- <prompt>`
 
 with `LOOPD_WORKER` set to the worker's name. Each pass runs in its own process group, and loopd
 kills the group when the pass ends, so nothing the agent started keeps running. Its stdout goes to
 `<logs>/<worker>/<time>.jsonl` and its stderr, if any, to `<time>.stderr`. After each pass loopd
-logs the exit status, and the cost or token use and the first line of the agent's final message.
+logs the exit status, the model Claude reports, the cost or token use, and the first line of the
+agent's final message.
 
 ## Notes
 

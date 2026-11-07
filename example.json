@@ -5,6 +5,8 @@
       "engine": "claude",
       "dir": "~/kb",
       "prompt": "/supervisor",
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
       "every": "20m",
       "timeout": "90m"
     },
