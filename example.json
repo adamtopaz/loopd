@@ -1,5 +1,4 @@
 {
-  "logs": "~/.loopd/logs",
   "workers": [
     {
       "name": "supervisor",

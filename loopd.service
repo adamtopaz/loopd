@@ -1,5 +1,6 @@
 # loopd as a systemd user service. To install:
 #   install -Dm755 loopd ~/.local/bin/loopd
+#   write your config to ~/.config/loopd/config.json; loopd picks up later edits by itself
 #   install -Dm644 loopd.service ~/.config/systemd/user/loopd.service
 #   systemctl --user daemon-reload && systemctl --user enable --now loopd
 #   loginctl enable-linger "$USER"   # keep it running while you're logged out
@@ -9,7 +10,7 @@
 Description=loopd: run coding agents in a loop
 
 [Service]
-ExecStart=%h/.local/bin/loopd run %h/.config/loopd/config.json
+ExecStart=%h/.local/bin/loopd run
 Restart=on-failure
 RestartSec=30
 # Only loopd gets SIGTERM, so that it can stop its passes in order.

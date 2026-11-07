@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,7 +23,7 @@ import (
 	"time"
 )
 
-// Config is the JSON file given to `loopd run`.
+// Config is loopd's JSON config file.
 type Config struct {
 	Logs    string   `json:"logs"`
 	Workers []Worker `json:"workers"`
@@ -53,30 +55,43 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 	return err
 }
 
-// grace is how long a pass gets to exit after SIGTERM before loopd kills it.
-var grace = 10 * time.Second
+var (
+	// grace is how long a pass gets to exit after SIGTERM before loopd kills it.
+	grace = 10 * time.Second
+	// pollInterval is how often loopd checks its config file for changes.
+	pollInterval = 5 * time.Second
+)
 
 var validName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-func loadConfig(path string) (*Config, error) {
-	file, err := os.Open(path)
+// defaultConfigPath is $XDG_CONFIG_HOME/loopd/config.json, or ~/.config/loopd/config.json.
+func defaultConfigPath() (string, error) {
+	dir, err := os.UserConfigDir()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	defer file.Close()
-	decoder := json.NewDecoder(file)
+	return filepath.Join(dir, "loopd", "config.json"), nil
+}
+
+// defaultLogs is $XDG_STATE_HOME/loopd/logs, or ~/.local/state/loopd/logs.
+func defaultLogs() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(dir) {
+		return filepath.Join(dir, "loopd", "logs")
+	}
+	return expand("~/.local/state/loopd/logs")
+}
+
+func parseConfig(data []byte) (*Config, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var config Config
 	if err := decoder.Decode(&config); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	if config.Logs == "" {
-		config.Logs = "~/.loopd/logs"
+		config.Logs = defaultLogs()
 	}
 	config.Logs = expand(config.Logs)
-	if len(config.Workers) == 0 {
-		return nil, errors.New("no workers configured")
-	}
 	seen := map[string]bool{}
 	for i := range config.Workers {
 		worker := &config.Workers[i]
@@ -192,7 +207,6 @@ func runPass(ctx context.Context, worker Worker, logPath string) result {
 	// Kill anything the agent left running in the background.
 	syscall.Kill(-pid, syscall.SIGKILL)
 
-	r.exit = 0
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
 		r.exit = exitErr.ExitCode()
@@ -292,21 +306,150 @@ func describe(worker Worker, r result) string {
 	return line
 }
 
-// loop runs a worker's passes until ctx ends, waiting worker.Every after each pass.
-func loop(ctx context.Context, worker Worker, logs string, logf func(string, ...any)) {
+// spec is everything a worker's loop needs from the config.
+type spec struct {
+	worker Worker
+	logs   string
+}
+
+// work runs a worker's passes until ctx ends or it receives nil on updates. A new spec on
+// updates applies from the next pass, and the wait before it counts from the end of the last pass.
+func work(ctx context.Context, s *spec, updates <-chan *spec, logf func(string, ...any)) {
+	// apply takes a new spec, and reports false if the worker has been removed.
+	apply := func(next *spec) bool {
+		if next == nil {
+			logf("%s: removed from the config", s.worker.Name)
+			return false
+		}
+		s = next
+		logf("%s: config changed", s.worker.Name)
+		return true
+	}
 	for {
-		logPath := filepath.Join(logs, worker.Name, time.Now().UTC().Format("20060102T150405.000Z")+".jsonl")
-		logf("%s: pass started, log %s", worker.Name, logPath)
-		logf("%s", describe(worker, runPass(ctx, worker, logPath)))
+		logPath := filepath.Join(s.logs, s.worker.Name, time.Now().UTC().Format("20060102T150405.000Z")+".jsonl")
+		logf("%s: pass started, log %s", s.worker.Name, logPath)
+		logf("%s", describe(s.worker, runPass(ctx, s.worker, logPath)))
 		if ctx.Err() != nil {
 			return
 		}
-		logf("%s: next pass in %s", worker.Name, worker.Every.Duration)
+		end := time.Now()
+		select {
+		case next := <-updates: // a change made during the pass
+			if !apply(next) {
+				return
+			}
+		default:
+		}
+	wait:
+		for {
+			wait := max(time.Until(end.Add(s.worker.Every.Duration)), 0)
+			logf("%s: next pass in %s", s.worker.Name, wait.Round(time.Second))
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case next := <-updates:
+				timer.Stop()
+				if !apply(next) {
+					return
+				}
+			case <-timer.C:
+				break wait
+			}
+		}
+	}
+}
+
+// runner is a worker's running loop, as the manager in run sees it.
+type runner struct {
+	updates chan *spec // holds at most the newest spec
+	done    chan struct{}
+	sent    *spec
+}
+
+func (r *runner) send(s *spec) {
+	select {
+	case <-r.updates:
+	default:
+	}
+	r.updates <- s
+	r.sent = s
+}
+
+// run starts a loop for each worker in the config at path, then checks the file every
+// pollInterval and brings the loops in line with it, until ctx ends.
+func run(ctx context.Context, path string, logf func(string, ...any)) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	config, err := parseConfig(data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	runners := map[string]*runner{}
+	var wg sync.WaitGroup
+	reconcile := func() {
+		wanted := map[string]*spec{}
+		for _, worker := range config.Workers {
+			wanted[worker.Name] = &spec{worker, config.Logs}
+		}
+		for name, r := range runners {
+			select {
+			case <-r.done:
+				delete(runners, name)
+				continue
+			default:
+			}
+			if wanted[name] == nil && r.sent != nil {
+				r.send(nil)
+			}
+		}
+		// A worker removed and added back before its loop has stopped keeps the same loop. One
+		// whose loop has already stopped gets a new loop, so that its passes never overlap.
+		for name, s := range wanted {
+			if r := runners[name]; r == nil {
+				r = &runner{updates: make(chan *spec, 1), done: make(chan struct{}), sent: s}
+				runners[name] = r
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer close(r.done)
+					work(ctx, s, r.updates, logf)
+				}()
+			} else if !reflect.DeepEqual(r.sent, s) {
+				r.send(s)
+			}
+		}
+	}
+	reconcile()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	var lastErr string
+	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(worker.Every.Duration):
+			wg.Wait()
+			return nil
+		case <-ticker.C:
 		}
+		next, err := os.ReadFile(path)
+		if err != nil {
+			if err.Error() != lastErr {
+				logf("loopd: %v; keeping the previous config", err)
+				lastErr = err.Error()
+			}
+		} else if lastErr = ""; !bytes.Equal(next, data) {
+			data = next
+			if parsed, err := parseConfig(next); err != nil {
+				logf("loopd: %s: %v; keeping the previous config", path, err)
+			} else {
+				config = parsed
+				logf("loopd: reloaded %s", path)
+			}
+		}
+		reconcile()
 	}
 }
 
@@ -319,26 +462,28 @@ func newLogger(out io.Writer) func(string, ...any) {
 }
 
 func main() {
-	if len(os.Args) != 3 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: loopd run <config.json>")
+	args := os.Args[1:]
+	if len(args) == 0 || len(args) > 2 || args[0] != "run" {
+		fmt.Fprintln(os.Stderr, "usage: loopd run [config.json]")
 		os.Exit(2)
 	}
-	config, err := loadConfig(os.Args[2])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "loopd:", err)
-		os.Exit(1)
+	var path string
+	if len(args) == 2 {
+		path = args[1]
+	} else {
+		var err error
+		if path, err = defaultConfigPath(); err != nil {
+			fmt.Fprintln(os.Stderr, "loopd:", err)
+			os.Exit(1)
+		}
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	logf := newLogger(os.Stdout)
-	var wg sync.WaitGroup
-	for _, worker := range config.Workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			loop(ctx, worker, config.Logs, logf)
-		}()
+	logf("loopd: using %s", path)
+	if err := run(ctx, path, logf); err != nil {
+		fmt.Fprintln(os.Stderr, "loopd:", err)
+		os.Exit(1)
 	}
-	wg.Wait()
 	logf("loopd: stopped")
 }

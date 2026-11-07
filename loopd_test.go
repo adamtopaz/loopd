@@ -45,18 +45,10 @@ func TestCommand(t *testing.T) {
 	}
 }
 
-func writeConfig(t *testing.T, text string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func TestLoadConfig(t *testing.T) {
+func TestParseConfig(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/state")
 	dir := t.TempDir()
-	config, err := loadConfig(writeConfig(t, `{"workers": [{"name": "supervisor", "engine": "claude", "dir": "`+dir+`", "prompt": "/supervisor", "every": "20m"}]}`))
+	config, err := parseConfig([]byte(`{"workers": [{"name": "supervisor", "engine": "claude", "dir": "` + dir + `", "prompt": "/supervisor", "every": "20m"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,8 +56,11 @@ func TestLoadConfig(t *testing.T) {
 	if worker.Every.Duration != 20*time.Minute || worker.Timeout.Duration != time.Hour {
 		t.Errorf("every %s, timeout %s", worker.Every.Duration, worker.Timeout.Duration)
 	}
-	if home, _ := os.UserHomeDir(); config.Logs != filepath.Join(home, ".loopd/logs") {
+	if config.Logs != "/state/loopd/logs" {
 		t.Errorf("logs %q", config.Logs)
+	}
+	if config, err := parseConfig([]byte(`{"workers": []}`)); err != nil || len(config.Workers) != 0 {
+		t.Errorf("an empty worker list should be allowed: %v", err)
 	}
 
 	bad := map[string]string{
@@ -76,12 +71,23 @@ func TestLoadConfig(t *testing.T) {
 		"missing dir":    `{"workers": [{"name": "a", "engine": "claude", "dir": "` + dir + `/nope", "prompt": "p", "every": "1m"}]}`,
 		"no every":       `{"workers": [{"name": "a", "engine": "claude", "dir": "` + dir + `", "prompt": "p"}]}`,
 		"bad duration":   `{"workers": [{"name": "a", "engine": "claude", "dir": "` + dir + `", "prompt": "p", "every": 60}]}`,
-		"no workers":     `{"workers": []}`,
+		"not json":       `{"workers": [`,
 	}
 	for name, text := range bad {
-		if _, err := loadConfig(writeConfig(t, text)); err == nil {
+		if _, err := parseConfig([]byte(text)); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+}
+
+func TestDefaultPaths(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "/xdg/config")
+	if path, err := defaultConfigPath(); err != nil || path != "/xdg/config/loopd/config.json" {
+		t.Errorf("config path %q, %v", path, err)
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	if home, _ := os.UserHomeDir(); defaultLogs() != filepath.Join(home, ".local/state/loopd/logs") {
+		t.Errorf("logs %q", defaultLogs())
 	}
 }
 
@@ -219,7 +225,7 @@ func (l *lines) count(prefix string) int {
 	return n
 }
 
-func TestLoopRepeatsUntilStopped(t *testing.T) {
+func TestWorkRepeatsUntilStopped(t *testing.T) {
 	grace = 500 * time.Millisecond
 	worker := testWorker(t, fakeEngine(t, `echo '{"type":"result","result":"ok","total_cost_usd":0}'`))
 	worker.Every = Duration{50 * time.Millisecond}
@@ -227,20 +233,12 @@ func TestLoopRepeatsUntilStopped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
 	go func() {
-		loop(ctx, worker, t.TempDir(), log.logf)
+		work(ctx, &spec{worker, t.TempDir()}, make(chan *spec, 1), log.logf)
 		close(finished)
 	}()
-	for deadline := time.Now().Add(3 * time.Second); log.count("w: pass finished") < 3; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("passes: %q", log.text)
-		}
-	}
+	log.waitFor(t, "w: pass finished", 3)
 	cancel()
-	select {
-	case <-finished:
-	case <-time.After(2 * time.Second):
-		t.Fatal("loop didn't stop")
-	}
+	waitClosed(t, finished)
 }
 
 func TestStopDuringPass(t *testing.T) {
@@ -250,17 +248,141 @@ func TestStopDuringPass(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
 	go func() {
-		loop(ctx, worker, t.TempDir(), log.logf)
+		work(ctx, &spec{worker, t.TempDir()}, make(chan *spec, 1), log.logf)
 		close(finished)
 	}()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
-	select {
-	case <-finished:
-	case <-time.After(2 * time.Second):
-		t.Fatal("loop didn't stop")
-	}
+	waitClosed(t, finished)
 	if log.count("w: pass stopped") != 1 || log.count("w: next pass") != 0 {
 		t.Errorf("log %q", log.text)
+	}
+}
+
+func (l *lines) waitFor(t *testing.T, prefix string, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); l.count(prefix) < n; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			l.Lock()
+			defer l.Unlock()
+			t.Fatalf("wanted %d lines starting %q, log %q", n, prefix, l.text)
+		}
+	}
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("didn't stop")
+	}
+}
+
+// configFile writes a config whose workers all use the given fake engine.
+type configFile struct {
+	t    *testing.T
+	path string
+	dir  string
+	bin  string
+	logs string
+}
+
+func newConfigFile(t *testing.T, bin string) *configFile {
+	dir := t.TempDir()
+	return &configFile{t, filepath.Join(dir, "config.json"), dir, bin, filepath.Join(dir, "logs")}
+}
+
+// write sets the workers, given as name and every pairs, or writes raw text if given one string.
+func (c *configFile) write(workers ...string) {
+	c.t.Helper()
+	text := workers[0]
+	if len(workers) != 1 {
+		var entries []string
+		for i := 0; i < len(workers); i += 2 {
+			entries = append(entries, fmt.Sprintf(`{"name": %q, "engine": "claude", "bin": %q, "dir": %q, "prompt": "p", "every": %q}`,
+				workers[i], c.bin, c.dir, workers[i+1]))
+		}
+		text = fmt.Sprintf(`{"logs": %q, "workers": [%s]}`, c.logs, strings.Join(entries, ", "))
+	}
+	if err := os.WriteFile(c.path, []byte(text), 0o644); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+func startRun(t *testing.T, path string, log *lines) (cancel func(), finished chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	finished = make(chan struct{})
+	go func() {
+		if err := run(ctx, path, log.logf); err != nil {
+			t.Error(err)
+		}
+		close(finished)
+	}()
+	return cancel, finished
+}
+
+func TestReload(t *testing.T) {
+	grace, pollInterval = 500*time.Millisecond, 20*time.Millisecond
+	config := newConfigFile(t, fakeEngine(t, `echo '{"type":"result","result":"ok","total_cost_usd":0}'`))
+	config.write("a", "1h")
+	var log lines
+	cancel, finished := startRun(t, config.path, &log)
+	log.waitFor(t, "a: next pass in 1h", 1)
+
+	// Shortening every applies to the wait already under way, and a new worker starts.
+	config.write("a", "50ms", "b", "1h")
+	log.waitFor(t, "a: config changed", 1)
+	log.waitFor(t, "a: pass finished", 3)
+	log.waitFor(t, "b: pass finished", 1)
+
+	// A broken config is ignored.
+	config.write(`{"workers": [`)
+	log.waitFor(t, "loopd: "+config.path+": unexpected EOF; keeping the previous config", 1)
+	before := log.count("a: pass finished")
+	log.waitFor(t, "a: pass finished", before+2)
+
+	// Removing a worker stops it, and the others carry on.
+	config.write("b", "1h", "c", "1h")
+	log.waitFor(t, "a: removed from the config", 1)
+	log.waitFor(t, "c: pass finished", 1)
+	stopped := log.count("a: pass started")
+	time.Sleep(200 * time.Millisecond)
+	if log.count("a: pass started") != stopped || log.count("b: pass started") != 1 {
+		t.Errorf("log %q", log.text)
+	}
+	cancel()
+	waitClosed(t, finished)
+}
+
+func TestRemovedDuringPassFinishesIt(t *testing.T) {
+	grace, pollInterval = 500*time.Millisecond, 20*time.Millisecond
+	config := newConfigFile(t, fakeEngine(t, `sleep 0.5; echo '{"type":"result","result":"done","total_cost_usd":0}'`))
+	config.write("a", "1h")
+	var log lines
+	cancel, finished := startRun(t, config.path, &log)
+	log.waitFor(t, "a: pass started", 1)
+	config.write(`{"workers": []}`)
+	log.waitFor(t, "a: removed from the config", 1)
+	if log.count("a: pass finished") != 1 || log.count("a: next pass") != 0 {
+		t.Errorf("log %q", log.text)
+	}
+
+	// Added back once its loop has stopped, it gets a new loop.
+	config.write("a", "1h")
+	log.waitFor(t, "a: pass started", 2)
+	cancel()
+	waitClosed(t, finished)
+}
+
+func TestRunNeedsAValidConfigToStart(t *testing.T) {
+	var log lines
+	if err := run(context.Background(), filepath.Join(t.TempDir(), "missing.json"), log.logf); err == nil {
+		t.Error("no error for a missing config")
+	}
+	config := newConfigFile(t, "claude")
+	config.write(`{"workers": [`)
+	if err := run(context.Background(), config.path, log.logf); err == nil {
+		t.Error("no error for a broken config")
 	}
 }

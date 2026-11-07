@@ -8,7 +8,7 @@ example in a git repo.
 ## Install
 
 ```bash
-CGO_ENABLED=0 go install github.com/adamtopaz/loopd@latest
+CGO_ENABLED=0 GOBIN=~/.local/bin go install github.com/adamtopaz/loopd@latest
 ```
 
 Or build from a clone:
@@ -24,20 +24,32 @@ The result is a single static binary.
 ## Run
 
 ```bash
-loopd run config.json
+loopd run [config.json]
 ```
 
-loopd stays in the foreground and logs one line per event to stdout. SIGINT or SIGTERM stops it:
-it sends SIGTERM to any running pass, waits up to 10 seconds, then kills it. To run it as a
-service, see [`loopd.service`](loopd.service).
+The config defaults to `$XDG_CONFIG_HOME/loopd/config.json`, which is usually
+`~/.config/loopd/config.json`. loopd stays in the foreground and logs one line per event to
+stdout. SIGINT or SIGTERM stops it: it sends SIGTERM to any running pass, waits up to 10 seconds,
+then kills it. To run it as a service, see [`loopd.service`](loopd.service).
 
 ## Config
 
-See [`example.json`](example.json).
+See [`example.json`](example.json). loopd checks the file every 5 seconds and applies any change
+without a restart:
+
+- A new worker starts at once.
+- A changed worker uses its new settings from its next pass. A pass already running carries on as
+  it was. If the worker is waiting, its wait is recounted from the end of its last pass, so a
+  shorter `every` takes effect straight away.
+- A removed worker stops. If it is in the middle of a pass, it finishes that pass first.
+- If the new file is invalid, loopd logs why and keeps running the previous config.
+
+loopd only refuses to start if the config is missing or invalid. An empty `workers` list is
+valid, and leaves loopd idle until workers are added.
 
 | Field | Meaning |
 |---|---|
-| `logs` | Directory for pass logs. Default `~/.loopd/logs`. |
+| `logs` | Directory for pass logs. Default `$XDG_STATE_HOME/loopd/logs`, usually `~/.local/state/loopd/logs`. |
 | `workers[].name` | Letters, digits, `.`, `_` and `-`. Must be unique. |
 | `workers[].engine` | `claude` or `codex`. |
 | `workers[].bin` | The engine's binary. Default: `claude` or `codex` on `PATH`. |
