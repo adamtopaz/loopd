@@ -97,3 +97,7 @@ agent's final message.
 - **Codex.** Codex finds skills in `.agents/skills/`. Its sandbox defaults to read-only; set
   another with `args`, such as `["--sandbox", "workspace-write"]`. Note that `codex -p` selects a
   config profile; it is not print mode.
+
+## License
+
+Copyright 2026 Adam Topaz. Licensed under the [Apache License, Version 2.0](LICENSE).
