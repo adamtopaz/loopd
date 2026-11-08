@@ -826,3 +826,122 @@ func TestClaimOutsideAPass(t *testing.T) {
 		t.Errorf("error %v", err)
 	}
 }
+
+func TestBoard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.json")
+	b, err := openBoard(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.post("a", "", "taking issue 30")
+	b.post("operator", "b", "please look at PR 41")
+	b.post("b", "", "noted\nsecond line")
+	if _, err := b.post("a", "", "   "); err == nil {
+		t.Error("an empty message was accepted")
+	}
+	if _, err := b.post("a", "", strings.Repeat("x", messageLimit+1)); err == nil {
+		t.Error("an overlong message was accepted")
+	}
+	ids := func(messages []message) string {
+		var out []string
+		for _, m := range messages {
+			out = append(out, strconv.Itoa(m.ID))
+		}
+		return strings.Join(out, ",")
+	}
+	// a doesn't see its own post or the one for b. b sees both of the others.
+	if got, _ := b.unread("a"); ids(got) != "3" {
+		t.Errorf("a's unread: %s", ids(got))
+	}
+	if got, _ := b.unread("b"); ids(got) != "1,2" {
+		t.Errorf("b's unread: %s", ids(got))
+	}
+	if got, _ := b.unread("a"); len(got) != 0 {
+		t.Errorf("a's unread again: %s", ids(got))
+	}
+	if got := b.recent(2); ids(got) != "2,3" {
+		t.Errorf("recent: %s", ids(got))
+	}
+
+	// The messages and read positions survive reopening.
+	b.post("c", "", "hello")
+	reopened, err := openBoard(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := reopened.unread("a"); ids(got) != "4" {
+		t.Errorf("a's unread after reopening: %s", ids(got))
+	}
+	if m, _ := reopened.post("a", "", "next"); m.ID != 5 {
+		t.Errorf("next id %d", m.ID)
+	}
+
+	// The board keeps only the latest messages.
+	for i := 0; i < boardKeep+10; i++ {
+		reopened.post("a", "", "spam")
+	}
+	if got := reopened.recent(boardKeep + 100); len(got) != boardKeep || got[0].ID != 16 {
+		t.Errorf("kept %d messages, first %d", len(got), got[0].ID)
+	}
+}
+
+func TestBoardThroughTheDaemon(t *testing.T) {
+	grace = 500 * time.Millisecond
+	dir := t.TempDir()
+	bin := fakeEngine(t, `out="`+dir+`/$LOOPD_WORKER.env"
+{ echo "LOOPD_PASS=$LOOPD_PASS"; echo end; } > "$out.tmp" && mv "$out.tmp" "$out"
+sleep 1000`)
+	config := newConfigFile(t, bin)
+	config.write("a", "1h", "b", "1h")
+	var log lines
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
+	a, b := passEnv(t, filepath.Join(dir, "a.env")), passEnv(t, filepath.Join(dir, "b.env"))
+	post := func(pass, to, text string) error {
+		path := "/board"
+		if to != "" {
+			path += "?to=" + to
+		}
+		return send(d.socket, pass, http.MethodPost, path, strings.NewReader(text), nil)
+	}
+	read := func(pass, query string) []message {
+		var messages []message
+		if err := callAs(d.socket, pass, http.MethodGet, "/board"+query, &messages); err != nil {
+			t.Fatal(err)
+		}
+		return messages
+	}
+	if err := post(a["LOOPD_PASS"], "", "I'm taking issue 30"); err != nil {
+		t.Fatal(err)
+	}
+	if err := post("", "b", "please rebase"); err != nil {
+		t.Fatal(err)
+	}
+	if err := post("", "nobody", "hi"); err == nil || err.Error() != "nobody: no such worker" {
+		t.Errorf("post to an unknown worker: %v", err)
+	}
+	if err := post("forged", "", "hi"); err == nil {
+		t.Error("a forged pass token could post")
+	}
+	got := read(b["LOOPD_PASS"], "")
+	if len(got) != 2 || got[0].From != "a" || got[1].From != "operator" || got[1].To != "b" {
+		t.Errorf("b's unread: %+v", got)
+	}
+	if again := read(b["LOOPD_PASS"], ""); len(again) != 0 {
+		t.Errorf("b's unread again: %+v", again)
+	}
+	if all := read(b["LOOPD_PASS"], "?all=1"); len(all) != 2 {
+		t.Errorf("all: %+v", all)
+	}
+	if outside := read("", ""); len(outside) != 2 {
+		t.Errorf("read outside a pass: %+v", outside)
+	}
+	if _, err := os.Stat(filepath.Join(config.logs, "board.json")); err != nil {
+		t.Errorf("board file: %v", err)
+	}
+	var out strings.Builder
+	printMessages(&out, got, got[1].Time.Add(90*time.Second))
+	if !strings.Contains(out.String(), "#2 operator to b, 1m30s ago: please rebase\n") {
+		t.Errorf("printed %q", out.String())
+	}
+}

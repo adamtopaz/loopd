@@ -30,7 +30,11 @@ const usage = `usage:
   loopd cancel <worker>     stop the pass under way
   loopd claim <key> [note]  claim a key for the pass under way (only inside a pass)
   loopd release <key>       release a key this pass claimed
-  loopd claims              list the claims that passes hold`
+  loopd claims              list the claims that passes hold
+  loopd post [--to <worker>] [--file <path>] [message]
+                            post a message on the board, to everyone or to one worker
+  loopd board [--all]       inside a pass, show this worker's unread messages; with --all or
+                            outside a pass, show the latest messages`
 
 // confirmations are printed after a control command succeeds.
 var confirmations = map[string]string{
@@ -63,6 +67,12 @@ func main() {
 		err = releaseKey(os.Stdout, args[1])
 	case len(args) == 1 && args[0] == "claims":
 		err = showClaims(os.Stdout)
+	case len(args) >= 1 && args[0] == "post":
+		err = postMessage(os.Stdout, args[1:])
+	case len(args) == 1 && args[0] == "board":
+		err = showBoard(os.Stdout, false)
+	case len(args) == 2 && args[0] == "board" && args[1] == "--all":
+		err = showBoard(os.Stdout, true)
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -108,13 +118,18 @@ func call(socket, method, path string, out any) error {
 
 // callAs is call on behalf of the pass with the given token.
 func callAs(socket, pass, method, path string, out any) error {
+	return send(socket, pass, method, path, nil, out)
+}
+
+// send is callAs with a request body.
+func send(socket, pass, method, path string, body io.Reader, out any) error {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 		}},
 	}
-	request, err := http.NewRequest(method, "http://loopd"+path, nil)
+	request, err := http.NewRequest(method, "http://loopd"+path, body)
 	if err != nil {
 		return err
 	}
@@ -126,13 +141,13 @@ func callAs(socket, pass, method, path string, out any) error {
 		return fmt.Errorf("can't reach the daemon at %s; is `loopd run` running? (%v)", socket, err)
 	}
 	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
+	data, err := io.ReadAll(response.Body)
 	if err != nil {
 		return err
 	}
 	if response.StatusCode != http.StatusOK {
 		var e errorReply
-		if json.Unmarshal(body, &e) == nil && e.Error != "" {
+		if json.Unmarshal(data, &e) == nil && e.Error != "" {
 			return errors.New(e.Error)
 		}
 		return fmt.Errorf("the daemon replied %s", response.Status)
@@ -140,7 +155,7 @@ func callAs(socket, pass, method, path string, out any) error {
 	if out == nil {
 		return nil
 	}
-	return json.Unmarshal(body, out)
+	return json.Unmarshal(data, out)
 }
 
 // passToken is the LOOPD_PASS token that loopd gives each pass.
@@ -196,6 +211,75 @@ func showClaims(out io.Writer) error {
 		fmt.Fprintln(out, line)
 	}
 	return nil
+}
+
+// postMessage handles `loopd post [--to <worker>] [--file <path>] [message]`. Inside a pass the
+// message is from that pass's worker, and otherwise from "operator".
+func postMessage(out io.Writer, args []string) error {
+	var to, file string
+	var words []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--to" && i+1 < len(args):
+			to, i = args[i+1], i+1
+		case args[i] == "--file" && i+1 < len(args):
+			file, i = args[i+1], i+1
+		default:
+			words = append(words, args[i])
+		}
+	}
+	text := strings.Join(words, " ")
+	if file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		text = strings.TrimSpace(text + "\n" + string(data))
+	}
+	path := "/board"
+	if to != "" {
+		path += "?" + url.Values{"to": {to}}.Encode()
+	}
+	var m message
+	if err := send(socketPath(), os.Getenv("LOOPD_PASS"), http.MethodPost, path, strings.NewReader(text), &m); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "posted #%d\n", m.ID)
+	return nil
+}
+
+func showBoard(out io.Writer, all bool) error {
+	path := "/board"
+	if all {
+		path += "?all=1"
+	}
+	var messages []message
+	if err := callAs(socketPath(), os.Getenv("LOOPD_PASS"), http.MethodGet, path, &messages); err != nil {
+		return err
+	}
+	if len(messages) == 0 {
+		if all || os.Getenv("LOOPD_PASS") == "" {
+			fmt.Fprintln(out, "no messages")
+		} else {
+			fmt.Fprintln(out, "no new messages")
+		}
+	}
+	printMessages(out, messages, time.Now())
+	return nil
+}
+
+func printMessages(out io.Writer, messages []message, now time.Time) {
+	for _, m := range messages {
+		to := "everyone"
+		if m.To != "" {
+			to = m.To
+		}
+		lines := strings.Split(m.Text, "\n")
+		fmt.Fprintf(out, "#%d %s to %s, %s ago: %s\n", m.ID, m.From, to, now.Sub(m.Time).Round(time.Second), lines[0])
+		for _, line := range lines[1:] {
+			fmt.Fprintf(out, "  %s\n", line)
+		}
+	}
 }
 
 func reloadConfig(out io.Writer) error {

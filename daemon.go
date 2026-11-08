@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -65,6 +66,14 @@ func (g *registry) begin(worker string) string {
 	defer g.mu.Unlock()
 	g.passes[hex.EncodeToString(token)] = worker
 	return hex.EncodeToString(token)
+}
+
+// worker names the worker whose pass has the given token.
+func (g *registry) worker(token string) (string, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	worker, ok := g.passes[token]
+	return worker, ok
 }
 
 // end forgets a pass and releases its claims.
@@ -373,6 +382,7 @@ type daemon struct {
 	path    string
 	socket  string
 	reg     *registry
+	board   *board
 	logf    func(string, ...any)
 	started time.Time
 	wg      sync.WaitGroup
@@ -523,6 +533,18 @@ func (d *daemon) status() daemonStatus {
 	return status
 }
 
+// knows reports whether a worker is in the config.
+func (d *daemon) knows(name string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, worker := range d.config.Workers {
+		if worker.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *daemon) control(name, action string) error {
 	d.mu.Lock()
 	r := d.runners[name]
@@ -582,6 +604,51 @@ func (d *daemon) handler() http.Handler {
 		}
 		reply(w, http.StatusOK, struct{}{})
 	})
+	mux.HandleFunc("POST /board", func(w http.ResponseWriter, req *http.Request) {
+		from := "operator"
+		if token := req.Header.Get(passHeader); token != "" {
+			worker, ok := d.reg.worker(token)
+			if !ok {
+				reply(w, http.StatusForbidden, errorReply{errNotInPass.Error()})
+				return
+			}
+			from = worker
+		}
+		to := req.URL.Query().Get("to")
+		if to != "" && !d.knows(to) {
+			reply(w, http.StatusNotFound, errorReply{fmt.Sprintf("%s: %v", to, errNoWorker)})
+			return
+		}
+		text, err := io.ReadAll(io.LimitReader(req.Body, 4*messageLimit+1))
+		if err != nil {
+			reply(w, http.StatusBadRequest, errorReply{err.Error()})
+			return
+		}
+		m, err := d.board.post(from, to, string(text))
+		if err != nil {
+			reply(w, http.StatusBadRequest, errorReply{err.Error()})
+			return
+		}
+		reply(w, http.StatusOK, m)
+	})
+	mux.HandleFunc("GET /board", func(w http.ResponseWriter, req *http.Request) {
+		token := req.Header.Get(passHeader)
+		if token == "" || req.URL.Query().Get("all") != "" {
+			reply(w, http.StatusOK, d.board.recent(boardShow))
+			return
+		}
+		worker, ok := d.reg.worker(token)
+		if !ok {
+			reply(w, http.StatusForbidden, errorReply{errNotInPass.Error()})
+			return
+		}
+		messages, err := d.board.unread(worker)
+		if err != nil {
+			reply(w, http.StatusInternalServerError, errorReply{err.Error()})
+			return
+		}
+		reply(w, http.StatusOK, messages)
+	})
 	mux.HandleFunc("POST /workers/{name}/{action}", func(w http.ResponseWriter, req *http.Request) {
 		name, action := req.PathValue("name"), req.PathValue("action")
 		switch err := d.control(name, action); {
@@ -637,6 +704,9 @@ func run(ctx context.Context, path, socket string, logf func(string, ...any)) er
 	d := &daemon{ctx: ctx, path: path, socket: socket, reg: newRegistry(), logf: logf, started: time.Now(), runners: map[string]*runner{}}
 	config, err := d.load()
 	if err != nil {
+		return err
+	}
+	if d.board, err = openBoard(filepath.Join(config.Logs, "board.json")); err != nil {
 		return err
 	}
 	listener, err := listen(socket)

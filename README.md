@@ -36,6 +36,10 @@ loopd cancel <worker>     stop the pass under way
 loopd claim <key> [note]  claim a key for the pass under way (only inside a pass)
 loopd release <key>       release a key this pass claimed
 loopd claims              list the claims that passes hold
+loopd post [--to <worker>] [--file <path>] [message]
+                          post a message on the board, to everyone or to one worker
+loopd board [--all]       inside a pass, show this worker's unread messages; with --all or
+                          outside a pass, show the latest messages
 ```
 
 The daemon stays in the foreground and logs one line per event to stdout. SIGINT or SIGTERM stops
@@ -112,10 +116,29 @@ such as `pr-31`, `issue-30` or `entry:hyperbolic-curve`. A pass can `loopd relea
 Otherwise loopd releases all of a pass's claims when the pass ends, however it ends, so a claim
 never outlives the agent that made it. `loopd claims` and `loopd status` show who holds what.
 
+They can also talk through the **message board**. `loopd post <message>` posts to everyone, and
+`loopd post --to <worker> <message>` to one worker. `--file <path>` posts a longer message from a
+file. Inside a pass, `loopd board` shows the messages for that worker which it hasn't read yet,
+and marks them read. `loopd board --all`, or `loopd board` outside a pass, shows the latest 50.
+Posts made outside a pass, by people, come from "operator". The board keeps the latest 500
+messages, and where each worker has read up to, in `<logs>/board.json`, so both survive a restart.
+
 To make this work, each pass gets `LOOPD_PASS`, a token naming the pass, and `LOOPD_SOCKET`, and
-the directory holding loopd comes first on its `PATH`. A Claude Code agent needs permission to
-run the commands, such as `Bash(loopd claim *)`, `Bash(loopd release *)` and `Bash(loopd claims)`
-in a skill's `allowed-tools`.
+the directory holding loopd comes first on its `PATH`.
+
+### Telling agents how
+
+[`skills/loopd/SKILL.md`](skills/loopd/SKILL.md) is a skill that explains claims and the board to
+an agent, with nothing specific to any project. Install it where your agents find skills: for
+Claude Code, `~/.claude/skills/loopd/SKILL.md`, and for Codex, `~/.agents/skills/loopd/SKILL.md`.
+Then give each worker its name in its prompt and point it at the skill, for example
+`"prompt": "/researcher You are {name}, one of several agents that loopd runs at once. Use the
+loopd skill to coordinate with the others."`. Codex prompts can name the skill as `$loopd`.
+
+The skill grants its commands to Claude Code through `allowed-tools`. If the agent's main task
+runs as a skill with `context: fork`, grant them to the whole session instead, with `"args":
+["--allowedTools", "Bash(loopd claim *)", "Bash(loopd release *)", "Bash(loopd claims)",
+"Bash(loopd post *)", "Bash(loopd board)", "Bash(loopd board --all)"]`.
 
 ## Notes
 
