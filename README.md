@@ -23,26 +23,41 @@ The result is a single static binary.
 
 ## Run
 
-```bash
-loopd run [config.json]
+`loopd run` is the daemon. The other subcommands talk to it through its control socket.
+
+```text
+loopd run [config.json]   run the daemon (config defaults to $XDG_CONFIG_HOME/loopd/config.json)
+loopd status [--json]     show the daemon and its workers
+loopd reload              re-read the config and apply it
+loopd pause <worker>      stop after the pass under way, if any
+loopd resume <worker>     undo pause
+loopd wake <worker>       start a pass now
+loopd cancel <worker>     stop the pass under way
 ```
 
-The config defaults to `$XDG_CONFIG_HOME/loopd/config.json`, which is usually
-`~/.config/loopd/config.json`. loopd stays in the foreground and logs one line per event to
-stdout. SIGINT or SIGTERM stops it: it sends SIGTERM to any running pass, waits up to 10 seconds,
-then kills it. To run it as a service, see [`loopd.service`](loopd.service).
+The daemon stays in the foreground and logs one line per event to stdout. SIGINT or SIGTERM stops
+it: it sends SIGTERM to any running pass, waits up to 10 seconds, then kills it. To run it as a
+service, see [`loopd.service`](loopd.service).
+
+The control socket is `$XDG_RUNTIME_DIR/loopd/loopd.sock`, or `$LOOPD_SOCKET` if that is set.
+Only the user running loopd can open it, which includes any agent loopd runs as that user. Its
+API is plain HTTP with JSON, so `curl --unix-socket <socket> http://loopd/status` works too.
+
+`status` shows each worker's state (running a pass, waiting for the next, or paused), its settings,
+how its last pass ended with the model Claude reports, cost and final message, and its current
+log. Pausing lasts until loopd restarts. To stop a worker for good, remove it from the config.
 
 ## Config
 
-See [`example.json`](example.json). loopd checks the file every 5 seconds and applies any change
-without a restart:
+See [`example.json`](example.json). loopd reads the file when it starts and on `loopd reload`, or
+SIGHUP, which `systemctl --user reload loopd` sends. A reload applies changes without a restart:
 
 - A new worker starts at once.
 - A changed worker uses its new settings from its next pass. A pass already running carries on as
   it was. If the worker is waiting, its wait is recounted from the end of its last pass, so a
   shorter `every` takes effect straight away.
 - A removed worker stops. If it is in the middle of a pass, it finishes that pass first.
-- If the new file is invalid, loopd logs why and keeps running the previous config.
+- If the file is invalid, `loopd reload` says why and the previous config stays in force.
 
 loopd only refuses to start if the config is missing or invalid. An empty `workers` list is
 valid, and leaves loopd idle until workers are added.

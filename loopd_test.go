@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -235,17 +236,23 @@ func (l *lines) count(prefix string) int {
 	return n
 }
 
+func startWork(t *testing.T, worker Worker, log *lines) (*runner, func(), chan struct{}) {
+	r := newRunner(&spec{worker, t.TempDir()})
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		r.work(ctx, log.logf)
+		close(finished)
+	}()
+	return r, cancel, finished
+}
+
 func TestWorkRepeatsUntilStopped(t *testing.T) {
 	grace = 500 * time.Millisecond
 	worker := testWorker(t, fakeEngine(t, `echo '{"type":"result","result":"ok","total_cost_usd":0}'`))
 	worker.Every = Duration{50 * time.Millisecond}
 	var log lines
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan struct{})
-	go func() {
-		work(ctx, &spec{worker, t.TempDir()}, make(chan *spec, 1), log.logf)
-		close(finished)
-	}()
+	_, cancel, finished := startWork(t, worker, &log)
 	log.waitFor(t, "w: pass finished", 3)
 	cancel()
 	waitClosed(t, finished)
@@ -255,12 +262,7 @@ func TestStopDuringPass(t *testing.T) {
 	grace = 500 * time.Millisecond
 	worker := testWorker(t, fakeEngine(t, `sleep 1000`))
 	var log lines
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan struct{})
-	go func() {
-		work(ctx, &spec{worker, t.TempDir()}, make(chan *spec, 1), log.logf)
-		close(finished)
-	}()
+	_, cancel, finished := startWork(t, worker, &log)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 	waitClosed(t, finished)
@@ -320,40 +322,129 @@ func (c *configFile) write(workers ...string) {
 	}
 }
 
-func startRun(t *testing.T, path string, log *lines) (cancel func(), finished chan struct{}) {
-	ctx, cancel := context.WithCancel(context.Background())
-	finished = make(chan struct{})
-	go func() {
-		if err := run(ctx, path, log.logf); err != nil {
-			t.Error(err)
-		}
-		close(finished)
-	}()
-	return cancel, finished
+// shortSocket is a socket path short enough for the kernel's limit on Unix socket names.
+func shortSocket(t *testing.T) string {
+	dir, err := os.MkdirTemp("/tmp", "ld")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
 }
 
-func TestReload(t *testing.T) {
-	grace, pollInterval = 500*time.Millisecond, 20*time.Millisecond
-	config := newConfigFile(t, fakeEngine(t, `echo '{"type":"result","result":"ok","total_cost_usd":0}'`))
+type testDaemon struct {
+	t        *testing.T
+	socket   string
+	cancel   func()
+	finished chan struct{}
+}
+
+func startDaemon(t *testing.T, path string, log *lines) *testDaemon {
+	d := &testDaemon{t: t, socket: shortSocket(t), finished: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	d.cancel = cancel
+	go func() {
+		if err := run(ctx, path, d.socket, log.logf); err != nil {
+			t.Error(err)
+		}
+		close(d.finished)
+	}()
+	log.waitFor(t, "loopd: config", 1)
+	return d
+}
+
+func (d *testDaemon) stop() {
+	d.cancel()
+	waitClosed(d.t, d.finished)
+}
+
+func (d *testDaemon) reload() ([]string, error) {
+	var reply reloadReply
+	err := call(d.socket, http.MethodPost, "/reload", &reply)
+	return reply.Changes, err
+}
+
+func (d *testDaemon) control(worker, action string) error {
+	return call(d.socket, http.MethodPost, "/workers/"+worker+"/"+action, nil)
+}
+
+func (d *testDaemon) status() daemonStatus {
+	d.t.Helper()
+	var status daemonStatus
+	if err := call(d.socket, http.MethodGet, "/status", &status); err != nil {
+		d.t.Fatal(err)
+	}
+	return status
+}
+
+func (d *testDaemon) worker(name string) workerStatus {
+	d.t.Helper()
+	for _, worker := range d.status().Workers {
+		if worker.Name == name {
+			return worker
+		}
+	}
+	d.t.Fatalf("no worker %s in status", name)
+	return workerStatus{}
+}
+
+// waitState waits for a worker to reach a state.
+func (d *testDaemon) waitState(name, state string) workerStatus {
+	d.t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if worker := d.worker(name); worker.State == state {
+			return worker
+		} else if time.Now().After(deadline) {
+			d.t.Fatalf("%s is %s, not %s", name, worker.State, state)
+		}
+	}
+}
+
+const quickPass = `echo '{"type":"result","result":"ok","total_cost_usd":0}'`
+
+func TestReloadOnlyOnRequest(t *testing.T) {
+	grace = 500 * time.Millisecond
+	config := newConfigFile(t, fakeEngine(t, quickPass))
 	config.write("a", "1h")
 	var log lines
-	cancel, finished := startRun(t, config.path, &log)
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
 	log.waitFor(t, "a: next pass in 1h", 1)
 
-	// Shortening every applies to the wait already under way, and a new worker starts.
+	// Editing the file alone changes nothing.
 	config.write("a", "50ms", "b", "1h")
-	log.waitFor(t, "a: config changed", 1)
+	time.Sleep(200 * time.Millisecond)
+	if log.count("a: config changed") != 0 || log.count("b: pass started") != 0 {
+		t.Fatalf("the config changed without a reload: %q", log.text)
+	}
+
+	// Shortening every applies to the wait already under way, and a new worker starts.
+	changes, err := d.reload()
+	if err != nil || strings.Join(changes, ", ") != "changed a, added b" {
+		t.Fatalf("reload: %q, %v", changes, err)
+	}
 	log.waitFor(t, "a: pass finished", 3)
 	log.waitFor(t, "b: pass finished", 1)
 
-	// A broken config is ignored.
+	// A broken config is refused, with the reason, and the old one stays in force.
 	config.write(`{"workers": [`)
-	log.waitFor(t, "loopd: "+config.path+": unexpected EOF; keeping the previous config", 1)
+	if _, err := d.reload(); err == nil || !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Errorf("broken config: %v", err)
+	}
 	before := log.count("a: pass finished")
 	log.waitFor(t, "a: pass finished", before+2)
 
+	// Reloading an unchanged file reports no changes.
+	config.write("a", "50ms", "b", "1h")
+	if changes, err := d.reload(); err != nil || len(changes) != 0 {
+		t.Errorf("unchanged reload: %q, %v", changes, err)
+	}
+
 	// Removing a worker stops it, and the others carry on.
 	config.write("b", "1h", "c", "1h")
+	if changes, err := d.reload(); err != nil || strings.Join(changes, ", ") != "added c, removed a" {
+		t.Errorf("reload: %q, %v", changes, err)
+	}
 	log.waitFor(t, "a: removed from the config", 1)
 	log.waitFor(t, "c: pass finished", 1)
 	stopped := log.count("a: pass started")
@@ -361,18 +452,30 @@ func TestReload(t *testing.T) {
 	if log.count("a: pass started") != stopped || log.count("b: pass started") != 1 {
 		t.Errorf("log %q", log.text)
 	}
-	cancel()
-	waitClosed(t, finished)
+	names := []string{}
+	for _, worker := range d.status().Workers {
+		names = append(names, worker.Name)
+	}
+	if strings.Join(names, " ") != "b c" {
+		t.Errorf("status lists %q", names)
+	}
 }
 
 func TestRemovedDuringPassFinishesIt(t *testing.T) {
-	grace, pollInterval = 500*time.Millisecond, 20*time.Millisecond
+	grace = 500 * time.Millisecond
 	config := newConfigFile(t, fakeEngine(t, `sleep 0.5; echo '{"type":"result","result":"done","total_cost_usd":0}'`))
 	config.write("a", "1h")
 	var log lines
-	cancel, finished := startRun(t, config.path, &log)
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
 	log.waitFor(t, "a: pass started", 1)
 	config.write(`{"workers": []}`)
+	if _, err := d.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if worker := d.worker("a"); !worker.Removed || worker.State != "running" {
+		t.Errorf("status during the last pass: %+v", worker)
+	}
 	log.waitFor(t, "a: removed from the config", 1)
 	if log.count("a: pass finished") != 1 || log.count("a: next pass") != 0 {
 		t.Errorf("log %q", log.text)
@@ -380,19 +483,176 @@ func TestRemovedDuringPassFinishesIt(t *testing.T) {
 
 	// Added back once its loop has stopped, it gets a new loop.
 	config.write("a", "1h")
+	if _, err := d.reload(); err != nil {
+		t.Fatal(err)
+	}
 	log.waitFor(t, "a: pass started", 2)
+}
+
+func TestControls(t *testing.T) {
+	grace = 500 * time.Millisecond
+	config := newConfigFile(t, fakeEngine(t, quickPass))
+	config.write("a", "1h")
+	var log lines
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
+
+	waiting := d.waitState("a", "waiting")
+	if waiting.Passes != 1 || waiting.Next == nil || time.Until(*waiting.Next) < 59*time.Minute || waiting.Last == nil ||
+		!strings.HasPrefix(waiting.Last.Outcome, "finished in") || waiting.Last.Summary != "$0.00: ok" {
+		t.Errorf("status after the first pass: %+v", waiting)
+	}
+
+	// wake skips the wait.
+	if err := d.control("a", "wake"); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "a: pass finished", 2)
+
+	// pause stops the loop, and wake still runs one pass while it is paused.
+	if err := d.control("a", "pause"); err != nil {
+		t.Fatal(err)
+	}
+	d.waitState("a", "paused")
+	if err := d.control("a", "pause"); err == nil {
+		t.Error("pausing twice gave no error")
+	}
+	if err := d.control("a", "wake"); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "a: pass finished", 3)
+	if worker := d.waitState("a", "paused"); worker.Passes != 3 {
+		t.Errorf("passes %d", worker.Passes)
+	}
+
+	// resume goes back to waiting, counting from the end of the last pass.
+	if err := d.control("a", "resume"); err != nil {
+		t.Fatal(err)
+	}
+	d.waitState("a", "waiting")
+	if err := d.control("a", "resume"); err == nil {
+		t.Error("resuming a worker that isn't paused gave no error")
+	}
+
+	// Errors name the problem.
+	if err := d.control("a", "cancel"); err == nil || err.Error() != "a: no pass is running" {
+		t.Errorf("cancel while waiting: %v", err)
+	}
+	if err := d.control("nobody", "wake"); err == nil || err.Error() != "nobody: no such worker" {
+		t.Errorf("unknown worker: %v", err)
+	}
+	if err := d.control("a", "explode"); err == nil {
+		t.Error("unknown action gave no error")
+	}
+
+	var out strings.Builder
+	printStatus(&out, d.status(), time.Now())
+	for _, want := range []string{"\na: waiting, next pass in 1h", "claude, every 1h0m0s, timeout 1h0m0s, passes so far: 3", "    $0.00: ok"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("status output %q lacks %q", out.String(), want)
+		}
+	}
+}
+
+func TestCancelRunningPass(t *testing.T) {
+	grace = 500 * time.Millisecond
+	config := newConfigFile(t, fakeEngine(t, `sleep 1000`))
+	config.write("a", "1h")
+	var log lines
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
+	d.waitState("a", "running")
+	if err := d.control("a", "wake"); err == nil {
+		t.Error("wake during a pass gave no error")
+	}
+	if err := d.control("a", "pause"); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	printStatus(&out, d.status(), time.Now())
+	if !strings.Contains(out.String(), "a: running a pass for") || !strings.Contains(out.String(), ", then pausing") {
+		t.Errorf("status output %q", out.String())
+	}
+	if err := d.control("a", "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "a: pass cancelled after", 1)
+	worker := d.waitState("a", "paused")
+	time.Sleep(100 * time.Millisecond)
+	if n := log.count("a: paused"); n != 1 {
+		t.Errorf("logged paused %d times", n)
+	}
+	if worker.Last == nil || !strings.HasPrefix(worker.Last.Outcome, "cancelled after") {
+		t.Errorf("status after cancel: %+v", worker)
+	}
+}
+
+func TestOneDaemonPerSocket(t *testing.T) {
+	config := newConfigFile(t, fakeEngine(t, quickPass))
+	config.write("a", "1h")
+	var log lines
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
+	err := run(context.Background(), config.path, d.socket, log.logf)
+	if err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Errorf("second daemon: %v", err)
+	}
+	if info, err := os.Stat(d.socket); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("socket: %v, %v", info, err)
+	}
+}
+
+func TestStaleSocketIsReplaced(t *testing.T) {
+	config := newConfigFile(t, fakeEngine(t, quickPass))
+	config.write("a", "1h")
+	socket := shortSocket(t)
+	if err := os.WriteFile(socket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var log lines
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		if err := run(ctx, config.path, socket, log.logf); err != nil {
+			t.Error(err)
+		}
+		close(finished)
+	}()
+	log.waitFor(t, "a: pass finished", 1)
 	cancel()
 	waitClosed(t, finished)
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("socket left behind after shutdown: %v", err)
+	}
+}
+
+func TestClientWithoutDaemon(t *testing.T) {
+	err := call(shortSocket(t), http.MethodGet, "/status", nil)
+	if err == nil || !strings.Contains(err.Error(), "is `loopd run` running?") {
+		t.Errorf("error %v", err)
+	}
+}
+
+func TestSocketPath(t *testing.T) {
+	t.Setenv("LOOPD_SOCKET", "")
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	if path := socketPath(); path != "/run/user/1000/loopd/loopd.sock" {
+		t.Errorf("socket path %q", path)
+	}
+	t.Setenv("LOOPD_SOCKET", "/elsewhere/s")
+	if path := socketPath(); path != "/elsewhere/s" {
+		t.Errorf("socket path %q", path)
+	}
 }
 
 func TestRunNeedsAValidConfigToStart(t *testing.T) {
 	var log lines
-	if err := run(context.Background(), filepath.Join(t.TempDir(), "missing.json"), log.logf); err == nil {
+	if err := run(context.Background(), filepath.Join(t.TempDir(), "missing.json"), shortSocket(t), log.logf); err == nil {
 		t.Error("no error for a missing config")
 	}
 	config := newConfigFile(t, "claude")
 	config.write(`{"workers": [`)
-	if err := run(context.Background(), config.path, log.logf); err == nil {
+	if err := run(context.Background(), config.path, shortSocket(t), log.logf); err == nil {
 		t.Error("no error for a broken config")
 	}
 }
