@@ -56,8 +56,10 @@ type result struct {
 	summary  string
 }
 
-// runPass runs one pass, writing its stdout to logPath and its stderr next to it.
-func runPass(ctx context.Context, worker Worker, logPath string) result {
+// runPass runs one pass, writing its stdout to logPath and its stderr next to it. The pass's
+// environment gets env, and the directory holding loopd goes first on its PATH, so that the agent
+// can run `loopd claim` and the like.
+func runPass(ctx context.Context, worker Worker, logPath string, env []string) result {
 	start := time.Now()
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return result{err: err}
@@ -81,6 +83,10 @@ func runPass(ctx context.Context, worker Worker, logPath string) result {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = append(os.Environ(), "LOOPD_WORKER="+worker.Name)
+	if exe, err := os.Executable(); err == nil {
+		cmd.Env = append(cmd.Env, "PATH="+filepath.Dir(exe)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	cmd.Env = append(cmd.Env, env...)
 	for key, value := range worker.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}

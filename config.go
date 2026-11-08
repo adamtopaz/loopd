@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,9 +18,10 @@ type Config struct {
 	Workers []Worker `json:"workers"`
 }
 
-// Worker is one agent that loopd runs pass after pass.
+// Worker is one agent that loopd runs pass after pass, or several copies of one.
 type Worker struct {
 	Name    string            `json:"name"`
+	Copies  int               `json:"copies"`
 	Engine  string            `json:"engine"`
 	Bin     string            `json:"bin"`
 	Dir     string            `json:"dir"`
@@ -75,12 +77,18 @@ func parseConfig(data []byte) (*Config, error) {
 		config.Logs = defaultLogs()
 	}
 	config.Logs = expand(config.Logs)
-	seen := map[string]bool{}
-	for i := range config.Workers {
-		worker := &config.Workers[i]
+	for i, worker := range config.Workers {
 		if !validName.MatchString(worker.Name) {
 			return nil, fmt.Errorf("worker %d: name %q must be letters, digits, '.', '_' or '-'", i+1, worker.Name)
 		}
+		if worker.Copies < 0 || worker.Copies > 100 {
+			return nil, fmt.Errorf("worker %s: copies must be between 1 and 100", worker.Name)
+		}
+	}
+	config.Workers = instances(config.Workers)
+	seen := map[string]bool{}
+	for i := range config.Workers {
+		worker := &config.Workers[i]
 		if seen[worker.Name] {
 			return nil, fmt.Errorf("worker %s: name used twice", worker.Name)
 		}
@@ -104,6 +112,37 @@ func parseConfig(data []byte) (*Config, error) {
 		worker.Bin = expand(worker.Bin)
 	}
 	return &config, nil
+}
+
+// instances turns each worker with copies above 1 into copies named name-1, name-2 and so on,
+// and fills in {name} and {copy} in each one's dir, prompt, args and env values.
+func instances(workers []Worker) []Worker {
+	var out []Worker
+	for _, worker := range workers {
+		copies := max(worker.Copies, 1)
+		for i := 1; i <= copies; i++ {
+			instance := worker
+			instance.Copies = 0
+			if copies > 1 {
+				instance.Name = fmt.Sprintf("%s-%d", worker.Name, i)
+			}
+			fill := strings.NewReplacer("{name}", instance.Name, "{copy}", strconv.Itoa(i))
+			instance.Dir = fill.Replace(worker.Dir)
+			instance.Prompt = fill.Replace(worker.Prompt)
+			instance.Args = nil
+			for _, arg := range worker.Args {
+				instance.Args = append(instance.Args, fill.Replace(arg))
+			}
+			if worker.Env != nil {
+				instance.Env = map[string]string{}
+				for key, value := range worker.Env {
+					instance.Env[key] = fill.Replace(value)
+				}
+			}
+			out = append(out, instance)
+		}
+	}
+	return out
 }
 
 func expand(path string) string {

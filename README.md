@@ -33,6 +33,9 @@ loopd pause <worker>      stop after the pass under way, if any
 loopd resume <worker>     undo pause
 loopd wake <worker>       start a pass now
 loopd cancel <worker>     stop the pass under way
+loopd claim <key> [note]  claim a key for the pass under way (only inside a pass)
+loopd release <key>       release a key this pass claimed
+loopd claims              list the claims that passes hold
 ```
 
 The daemon stays in the foreground and logs one line per event to stdout. SIGINT or SIGTERM stops
@@ -66,6 +69,7 @@ valid, and leaves loopd idle until workers are added.
 |---|---|
 | `logs` | Directory for pass logs. Default `$XDG_STATE_HOME/loopd/logs`, usually `~/.local/state/loopd/logs`. |
 | `workers[].name` | Letters, digits, `.`, `_` and `-`. Must be unique. |
+| `workers[].copies` | Run this many copies, named `<name>-1`, `<name>-2` and so on. Default 1. |
 | `workers[].engine` | `claude` or `codex`. |
 | `workers[].bin` | The engine's binary. Default: `claude` or `codex` on `PATH`. |
 | `workers[].dir` | Working directory for the pass. |
@@ -87,6 +91,31 @@ kills the group when the pass ends, so nothing the agent started keeps running. 
 `<logs>/<worker>/<time>.jsonl` and its stderr, if any, to `<time>.stderr`. After each pass loopd
 logs the exit status, the model Claude reports, the cost or token use, and the first line of the
 agent's final message.
+
+## Several agents at once
+
+Workers run side by side. To run several copies of one agent, give it `copies`. In `dir`,
+`prompt`, `args` and `env` values, `{name}` becomes each copy's name and `{copy}` its number:
+
+```json
+{"name": "researcher", "copies": 2, "engine": "claude", "dir": "~/kb-{name}",
+ "prompt": "/researcher {name}", "every": "5m"}
+```
+
+This runs `researcher-1` in `~/kb-researcher-1` and `researcher-2` in `~/kb-researcher-2`. Copies
+that change files usually need a directory each, such as their own git clone.
+
+Agents running at once coordinate through **claims**. Inside a pass, `loopd claim pr-31 reviewing`
+claims the key `pr-31` for that pass, or fails with exit status 1 and says which worker holds it,
+since when and why. A key is any line of text up to 200 characters, so a team can agree on names
+such as `pr-31`, `issue-30` or `entry:hyperbolic-curve`. A pass can `loopd release` a key early.
+Otherwise loopd releases all of a pass's claims when the pass ends, however it ends, so a claim
+never outlives the agent that made it. `loopd claims` and `loopd status` show who holds what.
+
+To make this work, each pass gets `LOOPD_PASS`, a token naming the pass, and `LOOPD_SOCKET`, and
+the directory holding loopd comes first on its `PATH`. A Claude Code agent needs permission to
+run the commands, such as `Bash(loopd claim *)`, `Bash(loopd release *)` and `Bash(loopd claims)`
+in a skill's `allowed-tools`.
 
 ## Notes
 

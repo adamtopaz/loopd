@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,12 +35,116 @@ type passStatus struct {
 	Log     string    `json:"log"`
 }
 
+// claim is a key that a pass has claimed, so that other passes keep off the work it names.
+type claim struct {
+	Key    string    `json:"key"`
+	Worker string    `json:"worker"`
+	Note   string    `json:"note,omitempty"`
+	Since  time.Time `json:"since"`
+	pass   string
+}
+
+// registry tracks the passes under way and their claims. A pass's claims end with the pass.
+type registry struct {
+	mu     sync.Mutex
+	passes map[string]string // pass token → worker name
+	claims map[string]*claim
+}
+
+func newRegistry() *registry {
+	return &registry{passes: map[string]string{}, claims: map[string]*claim{}}
+}
+
+var errNotInPass = errors.New("only a pass that loopd runs can claim, and LOOPD_PASS doesn't name one")
+
+// begin registers a pass and returns its token, which the pass gets as LOOPD_PASS.
+func (g *registry) begin(worker string) string {
+	token := make([]byte, 16)
+	rand.Read(token)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.passes[hex.EncodeToString(token)] = worker
+	return hex.EncodeToString(token)
+}
+
+// end forgets a pass and releases its claims.
+func (g *registry) end(token string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.passes, token)
+	for key, c := range g.claims {
+		if c.pass == token {
+			delete(g.claims, key)
+		}
+	}
+}
+
+func (g *registry) claim(token, key, note string) (claim, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	worker, ok := g.passes[token]
+	switch {
+	case !ok:
+		return claim{}, errNotInPass
+	case key == "" || len(key) > 200 || strings.ContainsAny(key, "\n\r"):
+		return claim{}, errors.New("a key must be one line of at most 200 characters")
+	}
+	if c := g.claims[key]; c != nil {
+		if c.pass != token {
+			held := fmt.Sprintf("%s is held by %s, claimed %s ago", key, c.Worker, time.Since(c.Since).Round(time.Second))
+			if c.Note != "" {
+				held += ": " + c.Note
+			}
+			return claim{}, errors.New(held)
+		}
+		if note != "" {
+			c.Note = note
+		}
+		return *c, nil
+	}
+	c := &claim{Key: key, Worker: worker, Note: note, Since: time.Now(), pass: token}
+	g.claims[key] = c
+	return *c, nil
+}
+
+func (g *registry) release(token, key string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.passes[token]; !ok {
+		return errNotInPass
+	}
+	switch c := g.claims[key]; {
+	case c == nil:
+		return fmt.Errorf("%s isn't claimed", key)
+	case c.pass != token:
+		return fmt.Errorf("%s is held by %s, not by this pass", key, c.Worker)
+	}
+	delete(g.claims, key)
+	return nil
+}
+
+// list returns the claims held by the pass with the given token, or all claims if it is empty.
+func (g *registry) list(token string) []claim {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	claims := []claim{}
+	for _, c := range g.claims {
+		if token == "" || c.pass == token {
+			claims = append(claims, *c)
+		}
+	}
+	sort.Slice(claims, func(i, j int) bool { return claims[i].Key < claims[j].Key })
+	return claims
+}
+
 // runner is one worker's loop and the controls on it.
 type runner struct {
 	updates chan *spec    // holds at most the newest spec; nil means the worker was removed
 	kick    chan struct{} // tells a waiting loop to look at its controls again
 	done    chan struct{}
 	sent    *spec // the spec last sent to the loop; only the daemon uses it, under its lock
+	reg     *registry
+	socket  string
 
 	mu         sync.Mutex
 	spec       *spec
@@ -48,17 +154,20 @@ type runner struct {
 	paused     bool
 	wakeNow    bool
 	cancelPass context.CancelCauseFunc
+	pass       string // the token of the pass under way
 	log        string
 	passes     int
 	last       *passStatus
 }
 
-func newRunner(s *spec) *runner {
+func newRunner(s *spec, reg *registry, socket string) *runner {
 	return &runner{
 		updates: make(chan *spec, 1),
 		kick:    make(chan struct{}, 1),
 		done:    make(chan struct{}),
 		sent:    s,
+		reg:     reg,
+		socket:  socket,
 		spec:    s,
 	}
 }
@@ -103,13 +212,15 @@ func (r *runner) work(ctx context.Context, logf func(string, ...any)) {
 		started := time.Now()
 		logPath := filepath.Join(s.logs, s.worker.Name, started.UTC().Format("20060102T150405.000Z")+".jsonl")
 		passCtx, cancel := context.WithCancelCause(ctx)
-		r.locked(func() { r.state, r.since, r.log, r.cancelPass = "running", started, logPath, cancel })
+		token := r.reg.begin(s.worker.Name)
+		r.locked(func() { r.state, r.since, r.log, r.cancelPass, r.pass = "running", started, logPath, cancel, token })
 		logf("%s: pass started, log %s", s.worker.Name, logPath)
-		res := runPass(passCtx, s.worker, logPath)
+		res := runPass(passCtx, s.worker, logPath, []string{"LOOPD_PASS=" + token, "LOOPD_SOCKET=" + r.socket})
 		cancel(nil)
+		r.reg.end(token)
 		logf("%s", describe(s.worker, res))
 		r.locked(func() {
-			r.cancelPass = nil
+			r.cancelPass, r.pass = nil, ""
 			r.passes++
 			r.last = &passStatus{Started: started, Outcome: outcome(s.worker, res), Summary: res.summary, Log: logPath}
 		})
@@ -227,6 +338,7 @@ type workerStatus struct {
 	Log     string      `json:"log,omitempty"`
 	Passes  int         `json:"passes"`
 	Last    *passStatus `json:"last,omitempty"`
+	Claims  []claim     `json:"claims,omitempty"`
 }
 
 func (r *runner) status() workerStatus {
@@ -242,6 +354,9 @@ func (r *runner) status() workerStatus {
 		next := r.next
 		status.Next = &next
 	}
+	if r.pass != "" {
+		status.Claims = r.reg.list(r.pass)
+	}
 	return status
 }
 
@@ -256,6 +371,8 @@ type daemonStatus struct {
 type daemon struct {
 	ctx     context.Context
 	path    string
+	socket  string
+	reg     *registry
 	logf    func(string, ...any)
 	started time.Time
 	wg      sync.WaitGroup
@@ -357,7 +474,7 @@ func (d *daemon) start(s *spec) {
 	if d.ctx.Err() != nil {
 		return
 	}
-	r := newRunner(s)
+	r := newRunner(s, d.reg, d.socket)
 	d.runners[s.worker.Name] = r
 	d.wg.Add(1)
 	go func() {
@@ -416,6 +533,9 @@ func (d *daemon) control(name, action string) error {
 	return r.control(action)
 }
 
+// passHeader carries the LOOPD_PASS token of the pass making a claim.
+const passHeader = "Loopd-Pass"
+
 type errorReply struct {
 	Error string `json:"error"`
 }
@@ -442,6 +562,25 @@ func (d *daemon) handler() http.Handler {
 			return
 		}
 		reply(w, http.StatusOK, reloadReply{Changes: append([]string{}, changes...)})
+	})
+	mux.HandleFunc("GET /claims", func(w http.ResponseWriter, req *http.Request) {
+		reply(w, http.StatusOK, d.reg.list(""))
+	})
+	mux.HandleFunc("POST /claim", func(w http.ResponseWriter, req *http.Request) {
+		query := req.URL.Query()
+		c, err := d.reg.claim(req.Header.Get(passHeader), query.Get("key"), query.Get("note"))
+		if err != nil {
+			reply(w, http.StatusConflict, errorReply{err.Error()})
+			return
+		}
+		reply(w, http.StatusOK, c)
+	})
+	mux.HandleFunc("POST /release", func(w http.ResponseWriter, req *http.Request) {
+		if err := d.reg.release(req.Header.Get(passHeader), req.URL.Query().Get("key")); err != nil {
+			reply(w, http.StatusConflict, errorReply{err.Error()})
+			return
+		}
+		reply(w, http.StatusOK, struct{}{})
 	})
 	mux.HandleFunc("POST /workers/{name}/{action}", func(w http.ResponseWriter, req *http.Request) {
 		name, action := req.PathValue("name"), req.PathValue("action")
@@ -495,7 +634,7 @@ func listen(path string) (net.Listener, error) {
 // run is the daemon: it starts a loop for each worker in the config at path and serves the
 // control socket until ctx ends. SIGHUP reloads the config, like `loopd reload`.
 func run(ctx context.Context, path, socket string, logf func(string, ...any)) error {
-	d := &daemon{ctx: ctx, path: path, logf: logf, started: time.Now(), runners: map[string]*runner{}}
+	d := &daemon{ctx: ctx, path: path, socket: socket, reg: newRegistry(), logf: logf, started: time.Now(), runners: map[string]*runner{}}
 	config, err := d.load()
 	if err != nil {
 		return err

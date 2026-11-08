@@ -109,7 +109,7 @@ echo '{"type":"result","result":"Reviewed #29.\nMore detail.","total_cost_usd":1
 	worker := testWorker(t, bin)
 	worker.Env = map[string]string{"EXTRA": "yes"}
 	logPath := filepath.Join(t.TempDir(), "w", "pass.jsonl")
-	r := runPass(context.Background(), worker, logPath)
+	r := runPass(context.Background(), worker, logPath, nil)
 	if r.err != nil || r.exit != 0 || r.stopped != "" {
 		t.Fatalf("result %+v", r)
 	}
@@ -127,7 +127,7 @@ echo '{"type":"result","result":"Reviewed #29.\nMore detail.","total_cost_usd":1
 func TestEmptyStderrIsRemovedAndExitCodeKept(t *testing.T) {
 	worker := testWorker(t, fakeEngine(t, `exit 3`))
 	logPath := filepath.Join(t.TempDir(), "pass.jsonl")
-	r := runPass(context.Background(), worker, logPath)
+	r := runPass(context.Background(), worker, logPath, nil)
 	if r.exit != 3 || r.err != nil {
 		t.Errorf("result %+v", r)
 	}
@@ -138,7 +138,7 @@ func TestEmptyStderrIsRemovedAndExitCodeKept(t *testing.T) {
 
 func TestMissingBinary(t *testing.T) {
 	worker := testWorker(t, filepath.Join(t.TempDir(), "nope"))
-	if r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl")); r.err == nil {
+	if r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl"), nil); r.err == nil {
 		t.Errorf("no error for a missing binary")
 	}
 }
@@ -192,7 +192,7 @@ sleep 1000`))
 	worker.Env = map[string]string{"PIDFILE": pidFile}
 	worker.Timeout = Duration{300 * time.Millisecond}
 	start := time.Now()
-	r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl"))
+	r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl"), nil)
 	if r.stopped != "timed out" {
 		t.Errorf("result %+v", r)
 	}
@@ -207,7 +207,7 @@ func TestLeftoverBackgroundProcessesAreKilled(t *testing.T) {
 	worker := testWorker(t, fakeEngine(t, `sleep 1000 > /dev/null 2>&1 &
 echo $! > "$PIDFILE"`))
 	worker.Env = map[string]string{"PIDFILE": pidFile}
-	if r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl")); r.exit != 0 || r.err != nil {
+	if r := runPass(context.Background(), worker, filepath.Join(t.TempDir(), "pass.jsonl"), nil); r.exit != 0 || r.err != nil {
 		t.Fatalf("result %+v", r)
 	}
 	waitGone(t, readPid(t, pidFile))
@@ -237,7 +237,7 @@ func (l *lines) count(prefix string) int {
 }
 
 func startWork(t *testing.T, worker Worker, log *lines) (*runner, func(), chan struct{}) {
-	r := newRunner(&spec{worker, t.TempDir()})
+	r := newRunner(&spec{worker, t.TempDir()}, newRegistry(), "")
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
 	go func() {
@@ -654,5 +654,175 @@ func TestRunNeedsAValidConfigToStart(t *testing.T) {
 	config.write(`{"workers": [`)
 	if err := run(context.Background(), config.path, shortSocket(t), log.logf); err == nil {
 		t.Error("no error for a broken config")
+	}
+}
+
+func TestCopies(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"kb-r-1", "kb-r-2", "kb-r-3", "kb-s"} {
+		os.Mkdir(filepath.Join(dir, sub), 0o755)
+	}
+	config, err := parseConfig([]byte(`{"workers": [
+		{"name": "r", "copies": 3, "engine": "claude", "dir": "` + dir + `/kb-{name}", "prompt": "/researcher {name}", "every": "5m",
+		 "args": ["--tag", "copy-{copy}"], "env": {"ME": "{name}"}},
+		{"name": "s", "engine": "claude", "dir": "` + dir + `/kb-s", "prompt": "/supervisor {name} {copy}", "every": "5m"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, worker := range config.Workers {
+		got = append(got, fmt.Sprintf("%s|%s|%s|%v|%s|%d", worker.Name, filepath.Base(worker.Dir), worker.Prompt, worker.Args, worker.Env["ME"], worker.Copies))
+	}
+	want := []string{
+		"r-1|kb-r-1|/researcher r-1|[--tag copy-1]|r-1|0",
+		"r-2|kb-r-2|/researcher r-2|[--tag copy-2]|r-2|0",
+		"r-3|kb-r-3|/researcher r-3|[--tag copy-3]|r-3|0",
+		"s|kb-s|/supervisor s 1|[]||0",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("instances:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	bad := map[string]string{
+		"clash":      `{"workers": [{"name": "r", "copies": 2, "engine": "claude", "dir": "` + dir + `", "prompt": "p", "every": "1m"}, {"name": "r-1", "engine": "claude", "dir": "` + dir + `", "prompt": "p", "every": "1m"}]}`,
+		"too many":   `{"workers": [{"name": "r", "copies": 101, "engine": "claude", "dir": "` + dir + `", "prompt": "p", "every": "1m"}]}`,
+		"negative":   `{"workers": [{"name": "r", "copies": -1, "engine": "claude", "dir": "` + dir + `", "prompt": "p", "every": "1m"}]}`,
+		"no own dir": `{"workers": [{"name": "r", "copies": 4, "engine": "claude", "dir": "` + dir + `/kb-{name}", "prompt": "p", "every": "1m"}]}`,
+	}
+	for name, text := range bad {
+		if _, err := parseConfig([]byte(text)); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+
+	// Raising copies adds copies without touching the others.
+	two, _ := parseConfig([]byte(`{"workers": [{"name": "r", "copies": 2, "engine": "claude", "dir": "` + dir + `/kb-{name}", "prompt": "p", "every": "5m"}]}`))
+	three, _ := parseConfig([]byte(`{"workers": [{"name": "r", "copies": 3, "engine": "claude", "dir": "` + dir + `/kb-{name}", "prompt": "p", "every": "5m"}]}`))
+	if changes := diff(two, three); strings.Join(changes, ", ") != "added r-3" {
+		t.Errorf("changes %q", changes)
+	}
+}
+
+func TestRegistry(t *testing.T) {
+	g := newRegistry()
+	a, b := g.begin("a"), g.begin("b")
+	if _, err := g.claim(a, "pr-1", "reviewing"); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := g.claim(a, "pr-1", ""); err != nil || c.Note != "reviewing" {
+		t.Errorf("claiming again from the same pass: %+v, %v", c, err)
+	}
+	if _, err := g.claim(b, "pr-1", ""); err == nil || !strings.HasPrefix(err.Error(), "pr-1 is held by a, claimed ") || !strings.HasSuffix(err.Error(), ": reviewing") {
+		t.Errorf("claiming a held key: %v", err)
+	}
+	if err := g.release(b, "pr-1"); err == nil || err.Error() != "pr-1 is held by a, not by this pass" {
+		t.Errorf("releasing another pass's claim: %v", err)
+	}
+	if _, err := g.claim("forged", "pr-2", ""); !errors.Is(err, errNotInPass) {
+		t.Errorf("claim from no pass: %v", err)
+	}
+	if _, err := g.claim(a, "", ""); err == nil {
+		t.Error("an empty key was accepted")
+	}
+	if _, err := g.claim(a, "two\nlines", ""); err == nil {
+		t.Error("a key with a newline was accepted")
+	}
+	g.claim(a, "issue-3", "")
+	if keys := len(g.list(a)); keys != 2 || len(g.list("")) != 2 || len(g.list(b)) != 0 {
+		t.Errorf("list: %d, %d, %d", keys, len(g.list("")), len(g.list(b)))
+	}
+	if err := g.release(a, "issue-3"); err != nil {
+		t.Error(err)
+	}
+	if err := g.release(a, "issue-3"); err == nil || err.Error() != "issue-3 isn't claimed" {
+		t.Errorf("releasing twice: %v", err)
+	}
+	// Ending a pass releases its claims, and its token stops working.
+	g.end(a)
+	if _, err := g.claim(b, "pr-1", ""); err != nil {
+		t.Errorf("claim after the holder ended: %v", err)
+	}
+	if _, err := g.claim(a, "pr-9", ""); !errors.Is(err, errNotInPass) {
+		t.Errorf("claim from an ended pass: %v", err)
+	}
+}
+
+// passEnv reads the environment a fake engine recorded for its pass.
+func passEnv(t *testing.T, path string) map[string]string {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		data, err := os.ReadFile(path)
+		if err != nil || !strings.HasSuffix(string(data), "end\n") {
+			continue
+		}
+		env := map[string]string{}
+		for _, line := range strings.Split(string(data), "\n") {
+			if key, value, ok := strings.Cut(line, "="); ok {
+				env[key] = value
+			}
+		}
+		return env
+	}
+	t.Fatalf("no environment in %s", path)
+	return nil
+}
+
+func TestClaimsBelongToPasses(t *testing.T) {
+	grace = 500 * time.Millisecond
+	dir := t.TempDir()
+	bin := fakeEngine(t, `out="`+dir+`/$LOOPD_WORKER.env"
+{ echo "LOOPD_PASS=$LOOPD_PASS"; echo "LOOPD_SOCKET=$LOOPD_SOCKET"; echo "PATH=$PATH"; echo end; } > "$out.tmp" && mv "$out.tmp" "$out"
+sleep 1000`)
+	config := newConfigFile(t, bin)
+	config.write("a", "1h", "b", "1h")
+	var log lines
+	d := startDaemon(t, config.path, &log)
+	defer d.stop()
+	a, b := passEnv(t, filepath.Join(dir, "a.env")), passEnv(t, filepath.Join(dir, "b.env"))
+
+	exe, _ := os.Executable()
+	if a["LOOPD_SOCKET"] != d.socket || a["LOOPD_PASS"] == "" || a["LOOPD_PASS"] == b["LOOPD_PASS"] ||
+		!strings.HasPrefix(a["PATH"], filepath.Dir(exe)+":") {
+		t.Fatalf("pass environment %q", a)
+	}
+
+	if err := callAs(d.socket, a["LOOPD_PASS"], http.MethodPost, "/claim?key=pr-1&note=reviewing", nil); err != nil {
+		t.Fatal(err)
+	}
+	err := callAs(d.socket, b["LOOPD_PASS"], http.MethodPost, "/claim?key=pr-1", nil)
+	if err == nil || !strings.Contains(err.Error(), "pr-1 is held by a") {
+		t.Errorf("second claim: %v", err)
+	}
+	if worker := d.worker("a"); len(worker.Claims) != 1 || worker.Claims[0].Key != "pr-1" || worker.Claims[0].Note != "reviewing" {
+		t.Errorf("status claims %+v", worker.Claims)
+	}
+	var claims []claim
+	if err := call(d.socket, http.MethodGet, "/claims", &claims); err != nil || len(claims) != 1 || claims[0].Worker != "a" {
+		t.Errorf("claims %+v, %v", claims, err)
+	}
+	var out strings.Builder
+	printStatus(&out, d.status(), time.Now())
+	if !strings.Contains(out.String(), "  claims: pr-1\n") {
+		t.Errorf("status output %q", out.String())
+	}
+
+	// When a's pass ends, its claim goes with it.
+	if err := d.control("a", "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	d.waitState("a", "waiting")
+	if err := callAs(d.socket, b["LOOPD_PASS"], http.MethodPost, "/claim?key=pr-1", nil); err != nil {
+		t.Errorf("claim after a's pass ended: %v", err)
+	}
+	if err := callAs(d.socket, a["LOOPD_PASS"], http.MethodPost, "/claim?key=pr-2", nil); err == nil {
+		t.Error("an ended pass's token still works")
+	}
+}
+
+func TestClaimOutsideAPass(t *testing.T) {
+	t.Setenv("LOOPD_PASS", "")
+	var out strings.Builder
+	if err := claimKey(&out, "pr-1", ""); err == nil || !strings.Contains(err.Error(), "LOOPD_PASS") {
+		t.Errorf("error %v", err)
 	}
 }

@@ -27,7 +27,10 @@ const usage = `usage:
   loopd pause <worker>      stop after the pass under way, if any
   loopd resume <worker>     undo pause
   loopd wake <worker>       start a pass now
-  loopd cancel <worker>     stop the pass under way`
+  loopd cancel <worker>     stop the pass under way
+  loopd claim <key> [note]  claim a key for the pass under way (only inside a pass)
+  loopd release <key>       release a key this pass claimed
+  loopd claims              list the claims that passes hold`
 
 // confirmations are printed after a control command succeeds.
 var confirmations = map[string]string{
@@ -54,6 +57,12 @@ func main() {
 		if err == nil {
 			fmt.Printf("%s: %s\n", args[1], confirmations[args[0]])
 		}
+	case len(args) >= 2 && args[0] == "claim":
+		err = claimKey(os.Stdout, args[1], strings.Join(args[2:], " "))
+	case len(args) == 2 && args[0] == "release":
+		err = releaseKey(os.Stdout, args[1])
+	case len(args) == 1 && args[0] == "claims":
+		err = showClaims(os.Stdout)
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -94,6 +103,11 @@ func newLogger(out io.Writer) func(string, ...any) {
 
 // call sends one request to the daemon and decodes its JSON reply into out.
 func call(socket, method, path string, out any) error {
+	return callAs(socket, "", method, path, out)
+}
+
+// callAs is call on behalf of the pass with the given token.
+func callAs(socket, pass, method, path string, out any) error {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -103,6 +117,9 @@ func call(socket, method, path string, out any) error {
 	request, err := http.NewRequest(method, "http://loopd"+path, nil)
 	if err != nil {
 		return err
+	}
+	if pass != "" {
+		request.Header.Set(passHeader, pass)
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -124,6 +141,61 @@ func call(socket, method, path string, out any) error {
 		return nil
 	}
 	return json.Unmarshal(body, out)
+}
+
+// passToken is the LOOPD_PASS token that loopd gives each pass.
+func passToken() (string, error) {
+	token := os.Getenv("LOOPD_PASS")
+	if token == "" {
+		return "", errors.New("claims work only inside a pass that loopd runs, where LOOPD_PASS is set")
+	}
+	return token, nil
+}
+
+func claimKey(out io.Writer, key, note string) error {
+	token, err := passToken()
+	if err != nil {
+		return err
+	}
+	query := url.Values{"key": {key}}
+	if note != "" {
+		query.Set("note", note)
+	}
+	if err := callAs(socketPath(), token, http.MethodPost, "/claim?"+query.Encode(), nil); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "claimed", key)
+	return nil
+}
+
+func releaseKey(out io.Writer, key string) error {
+	token, err := passToken()
+	if err != nil {
+		return err
+	}
+	if err := callAs(socketPath(), token, http.MethodPost, "/release?"+url.Values{"key": {key}}.Encode(), nil); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "released", key)
+	return nil
+}
+
+func showClaims(out io.Writer) error {
+	var claims []claim
+	if err := call(socketPath(), http.MethodGet, "/claims", &claims); err != nil {
+		return err
+	}
+	if len(claims) == 0 {
+		fmt.Fprintln(out, "no claims")
+	}
+	for _, c := range claims {
+		line := fmt.Sprintf("%s: %s, for %s", c.Key, c.Worker, time.Since(c.Since).Round(time.Second))
+		if c.Note != "" {
+			line += ": " + c.Note
+		}
+		fmt.Fprintln(out, line)
+	}
+	return nil
 }
 
 func reloadConfig(out io.Writer) error {
@@ -175,6 +247,13 @@ func printStatus(out io.Writer, status daemonStatus, now time.Time) {
 		}
 		if worker.Log != "" {
 			fmt.Fprintf(out, "  log: %s\n", worker.Log)
+		}
+		if len(worker.Claims) > 0 {
+			var keys []string
+			for _, c := range worker.Claims {
+				keys = append(keys, c.Key)
+			}
+			fmt.Fprintf(out, "  claims: %s\n", strings.Join(keys, ", "))
 		}
 	}
 }
